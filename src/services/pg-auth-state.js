@@ -3,7 +3,7 @@
  * Replaces useMultiFileAuthState — stores creds in DB instead of filesystem.
  * Survives Railway restarts, container redeployments, etc.
  */
-const { proto } = require('@whiskeysockets/baileys');
+const { proto, initAuthCreds: baileyInitAuthCreds } = require('@whiskeysockets/baileys');
 const { db } = require('../db');
 
 const KEY_PREFIX = 'auth:';
@@ -83,8 +83,10 @@ async function usePostgresAuthState(userId) {
  * Create initial empty auth creds (Baileys will fill them in).
  */
 function initAuthCreds() {
-  // Baileys auto-generates creds if they're undefined,
-  // but we need to return something that triggers the QR flow.
+  // Use Baileys' built-in initAuthCreds if available, otherwise return undefined
+  if (typeof baileyInitAuthCreds === 'function') {
+    return baileyInitAuthCreds();
+  }
   return undefined;
 }
 

@@ -14,8 +14,8 @@ router.post('/connect', async (req, res) => {
     const result = await waManager.startSession(req.userId);
     res.json(result);
   } catch (err) {
-    console.error('[WA Route] Connect error:', err.message);
-    res.status(500).json({ error: 'Failed to start WhatsApp session' });
+    console.error('[WA Route] Connect error:', err.message, err.stack);
+    res.status(500).json({ error: 'Failed to start WhatsApp session', detail: err.message });
   }
 });
 
