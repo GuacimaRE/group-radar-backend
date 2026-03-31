@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const QRCode = require('qrcode');
 const pino = require('pino');
-const db = require('../db');
+const { db } = require('../db');
 
 const SESSIONS_DIR = path.join(__dirname, '..', '..', 'data', 'sessions');
 const logger = pino({ level: 'warn' });

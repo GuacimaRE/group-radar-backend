@@ -2,7 +2,7 @@
  * User settings routes — categories, keywords, zones, prices, groups
  */
 const express = require('express');
-const db = require('../db');
+const { db } = require('../db');
 const { getUserId } = require('../middleware/auth');
 
 const router = express.Router();

@@ -11,7 +11,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const url = require('url');
 
-const db = require('./db');
+const { initDB, db } = require('./db');
 const waManager = require('./services/wa-manager');
 const Scanner = require('./services/scanner');
 
@@ -77,7 +77,13 @@ wss.on('connection', (ws, req) => {
 // Initialize scanner
 const scanner = new Scanner(waManager);
 
-// Start server
+// Start server (async init)
+async function start() {
+  await initDB();
+  console.log('[DB] Ready');
+}
+
+start().then(() => {
 server.listen(PORT, async () => {
   console.log(`
   ╔══════════════════════════════════════╗
@@ -90,6 +96,7 @@ server.listen(PORT, async () => {
   // Restore previously connected sessions
   await waManager.restoreAll();
 });
+}).catch(err => { console.error('Failed to start:', err); process.exit(1); });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {

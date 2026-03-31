@@ -2,7 +2,7 @@
  * Message Scanner
  * Matches incoming group messages against user's keywords, zones, and price ranges.
  */
-const db = require('../db');
+const { db } = require('../db');
 
 class Scanner {
   constructor(waManager) {

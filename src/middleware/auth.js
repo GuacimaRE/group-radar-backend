@@ -2,7 +2,7 @@
  * Simple auth middleware
  * For MVP: phone number in header. Production: JWT.
  */
-const db = require('../db');
+const { db } = require('../db');
 
 function getUserId(req, res, next) {
   const phone = req.headers['x-user-phone'];
