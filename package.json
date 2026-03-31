@@ -1,0 +1,21 @@
+{
+  "name": "group-radar-backend",
+  "version": "1.0.0",
+  "description": "Group Radar - WhatsApp group monitoring SaaS backend",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "better-sqlite3": "^11.8.1",
+    "ws": "^8.18.0",
+    "qrcode": "^1.5.4",
+    "dotenv": "^16.4.7",
+    "helmet": "^8.1.0",
+    "pino": "^9.6.0"
+  }
+}
