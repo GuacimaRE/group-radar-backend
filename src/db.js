@@ -131,8 +131,23 @@ const db = {
   prepare(sql) {
     return {
       async run(...params) {
-        const res = await pool.query(sql + ' RETURNING id', params);
-        return { lastInsertRowid: res.rows[0]?.id };
+        // Only add RETURNING for INSERT statements (not UPDATE/DELETE/ON CONFLICT)
+        const trimmed = sql.trim().toUpperCase();
+        let query = sql;
+        if (trimmed.startsWith('INSERT') && !sql.toUpperCase().includes('RETURNING')) {
+          query = sql + ' RETURNING id';
+        }
+        try {
+          const res = await pool.query(query, params);
+          return { lastInsertRowid: res.rows?.[0]?.id };
+        } catch (err) {
+          // If RETURNING fails (e.g., table has no id column), retry without it
+          if (err.message?.includes('column "id" does not exist')) {
+            const res = await pool.query(sql, params);
+            return { lastInsertRowid: null };
+          }
+          throw err;
+        }
       },
       async get(...params) {
         const res = await pool.query(sql, params);
