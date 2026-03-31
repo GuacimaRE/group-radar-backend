@@ -1,54 +1,43 @@
 /**
  * WhatsApp Session Manager
  * Manages one Baileys session per user.
+ * Auth state persisted in PostgreSQL (survives Railway restarts).
  */
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
-const path = require('path');
-const fs = require('fs');
 const QRCode = require('qrcode');
 const pino = require('pino');
 const { db } = require('../db');
+const { usePostgresAuthState } = require('./pg-auth-state');
 
-const SESSIONS_DIR = path.join(__dirname, '..', '..', 'data', 'sessions');
 const logger = pino({ level: 'warn' });
 
 class WAManager {
   constructor() {
-    // Map<userId, { socket, qr, status }>
     this.sessions = new Map();
-    // Listeners waiting for QR updates (WebSocket connections)
-    this.qrListeners = new Map(); // Map<userId, Set<ws>>
-    // Message handler callback
+    this.qrListeners = new Map();
     this.onMessage = null;
   }
 
-  /**
-   * Set the message handler for incoming group messages
-   */
   setMessageHandler(handler) {
     this.onMessage = handler;
   }
 
-  /**
-   * Start a WhatsApp session for a user.
-   * Returns the QR code as a data URL if not yet authenticated.
-   */
   async startSession(userId) {
-    // If session already exists and connected, skip
     if (this.sessions.has(userId)) {
       const existing = this.sessions.get(userId);
       if (existing.status === 'connected') {
         return { status: 'connected' };
       }
+      // Clean up stale session
+      if (existing.socket) {
+        try { existing.socket.end(); } catch {}
+      }
+      this.sessions.delete(userId);
     }
 
-    const sessionDir = path.join(SESSIONS_DIR, `user_${userId}`);
-    if (!fs.existsSync(sessionDir)) {
-      fs.mkdirSync(sessionDir, { recursive: true });
-    }
-
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    // Use PostgreSQL-backed auth state
+    const { state, saveCreds } = await usePostgresAuthState(userId);
     const { version } = await fetchLatestBaileysVersion();
 
     const socket = makeWASocket({
@@ -57,7 +46,6 @@ class WAManager {
       logger,
       printQRInTerminal: false,
       browser: ['Group Radar', 'Chrome', '120.0'],
-      // Reduce memory usage
       getMessage: async () => undefined,
     });
 
@@ -70,17 +58,13 @@ class WAManager {
 
     this.sessions.set(userId, sessionData);
 
-    // Handle connection updates
     socket.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // Generate QR as data URL
         const qrDataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
         sessionData.qr = qrDataUrl;
         sessionData.status = 'qr';
-
-        // Notify WebSocket listeners
         this._notifyQRListeners(userId, { type: 'qr', qr: qrDataUrl });
       }
 
@@ -89,19 +73,23 @@ class WAManager {
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
         sessionData.status = 'disconnected';
-        db.prepare('UPDATE wa_sessions SET status = ? WHERE user_id = ?')
-          .run('disconnected', userId);
+        try {
+          await db.prepare("UPDATE wa_sessions SET status = 'disconnected' WHERE user_id = $1").run(userId);
+        } catch {}
 
         this._notifyQRListeners(userId, { type: 'disconnected' });
 
         if (shouldReconnect) {
-          console.log(`[WA] User ${userId}: reconnecting...`);
-          setTimeout(() => this.startSession(userId), 3000);
-        } else {
-          console.log(`[WA] User ${userId}: logged out, cleaning session`);
+          console.log(`[WA] User ${userId}: reconnecting in 5s...`);
           this.sessions.delete(userId);
-          // Remove auth files so user can re-scan
-          fs.rmSync(sessionDir, { recursive: true, force: true });
+          setTimeout(() => this.startSession(userId), 5000);
+        } else {
+          console.log(`[WA] User ${userId}: logged out, clearing auth keys`);
+          this.sessions.delete(userId);
+          // Clear stored auth keys so user can re-scan
+          try {
+            await db.prepare('DELETE FROM wa_auth_keys WHERE user_id = $1').run(userId);
+          } catch {}
         }
       }
 
@@ -110,32 +98,29 @@ class WAManager {
         sessionData.status = 'connected';
         sessionData.qr = null;
 
-        db.prepare(`
-          INSERT INTO wa_sessions (user_id, status, last_connected)
-          VALUES (?, 'connected', datetime('now'))
-          ON CONFLICT(user_id) DO UPDATE SET status = 'connected', last_connected = datetime('now')
-        `).run(userId);
-
-        db.prepare('UPDATE users SET wa_connected = 1 WHERE id = ?').run(userId);
+        try {
+          await db.prepare(`
+            INSERT INTO wa_sessions (user_id, status, last_connected)
+            VALUES ($1, 'connected', NOW())
+            ON CONFLICT(user_id) DO UPDATE SET status = 'connected', last_connected = NOW()
+          `).run(userId);
+          await db.prepare('UPDATE users SET wa_connected = 1 WHERE id = $1').run(userId);
+        } catch (err) {
+          console.error(`[WA] DB update error:`, err.message);
+        }
 
         this._notifyQRListeners(userId, { type: 'connected' });
-
-        // Fetch user's groups and store them
         await this._syncGroups(userId, socket);
       }
     });
 
-    // Save credentials on update
     socket.ev.on('creds.update', saveCreds);
 
-    // Handle incoming messages (group messages)
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        // Only process group messages
         if (!msg.key.remoteJid?.endsWith('@g.us')) continue;
-        // Skip own messages
         if (msg.key.fromMe) continue;
 
         const text = msg.message?.conversation
@@ -158,64 +143,48 @@ class WAManager {
     return { status: 'connecting' };
   }
 
-  /**
-   * Sync user's WhatsApp groups to database
-   */
   async _syncGroups(userId, socket) {
     try {
       const groups = await socket.groupFetchAllParticipating();
-      const insertGroup = db.prepare(`
-        INSERT INTO user_groups (user_id, group_jid, group_name, enabled)
-        VALUES (?, ?, ?, 0)
-        ON CONFLICT(user_id, group_jid) DO UPDATE SET group_name = excluded.group_name
-      `);
 
-      const transaction = db.transaction((groups) => {
-        for (const [jid, meta] of Object.entries(groups)) {
-          insertGroup.run(userId, jid, meta.subject);
-        }
-      });
+      for (const [jid, meta] of Object.entries(groups)) {
+        await db.prepare(`
+          INSERT INTO user_groups (user_id, group_jid, group_name, enabled)
+          VALUES ($1, $2, $3, 0)
+          ON CONFLICT(user_id, group_jid) DO UPDATE SET group_name = EXCLUDED.group_name
+        `).run(userId, jid, meta.subject);
+      }
 
-      transaction(groups);
       console.log(`[WA] User ${userId}: synced ${Object.keys(groups).length} groups`);
     } catch (err) {
       console.error(`[WA] User ${userId}: group sync error:`, err.message);
     }
   }
 
-  /**
-   * Get session status for a user
-   */
   getStatus(userId) {
     const session = this.sessions.get(userId);
     if (!session) return { status: 'disconnected', qr: null };
     return { status: session.status, qr: session.qr };
   }
 
-  /**
-   * Disconnect a user's WhatsApp session
-   */
   async disconnect(userId) {
     const session = this.sessions.get(userId);
     if (session?.socket) {
-      await session.socket.logout();
+      try { await session.socket.logout(); } catch {}
       this.sessions.delete(userId);
     }
-    db.prepare('UPDATE wa_sessions SET status = ? WHERE user_id = ?')
-      .run('disconnected', userId);
-    db.prepare('UPDATE users SET wa_connected = 0 WHERE id = ?').run(userId);
+    try {
+      await db.prepare("UPDATE wa_sessions SET status = 'disconnected' WHERE user_id = $1").run(userId);
+      await db.prepare('UPDATE users SET wa_connected = 0 WHERE id = $1').run(userId);
+    } catch {}
   }
 
-  /**
-   * Register a WebSocket listener for QR updates
-   */
   addQRListener(userId, ws) {
     if (!this.qrListeners.has(userId)) {
       this.qrListeners.set(userId, new Set());
     }
     this.qrListeners.get(userId).add(ws);
 
-    // Send current QR if available
     const session = this.sessions.get(userId);
     if (session?.qr) {
       ws.send(JSON.stringify({ type: 'qr', qr: session.qr }));
@@ -237,17 +206,23 @@ class WAManager {
     }
   }
 
-  /**
-   * Restore sessions for users that were previously connected
-   */
   async restoreAll() {
-    const rows = db.prepare("SELECT user_id FROM wa_sessions WHERE status = 'connected'").all();
-    console.log(`[WA] Restoring ${rows.length} sessions...`);
-    for (const row of rows) {
-      const sessionDir = path.join(SESSIONS_DIR, `user_${row.user_id}`);
-      if (fs.existsSync(sessionDir)) {
-        await this.startSession(row.user_id);
+    try {
+      const rows = await db.prepare("SELECT user_id FROM wa_sessions WHERE status = 'connected'").all();
+      console.log(`[WA] Restoring ${rows.length} sessions...`);
+      for (const row of rows) {
+        // Check if auth keys exist in DB
+        const keys = await db.prepare('SELECT COUNT(*) as count FROM wa_auth_keys WHERE user_id = $1').get(row.user_id);
+        if (parseInt(keys.count) > 0) {
+          console.log(`[WA] Restoring session for user ${row.user_id}...`);
+          await this.startSession(row.user_id);
+        } else {
+          console.log(`[WA] No auth keys for user ${row.user_id}, skipping`);
+          await db.prepare("UPDATE wa_sessions SET status = 'disconnected' WHERE user_id = $1").run(row.user_id);
+        }
       }
+    } catch (err) {
+      console.error('[WA] Restore error:', err.message);
     }
   }
 }

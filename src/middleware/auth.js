@@ -4,19 +4,23 @@
  */
 const { db } = require('../db');
 
-function getUserId(req, res, next) {
+async function getUserId(req, res, next) {
   const phone = req.headers['x-user-phone'];
   if (!phone) {
     return res.status(401).json({ error: 'Not authenticated. Send x-user-phone header.' });
   }
 
-  const user = db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
-  if (!user) {
-    return res.status(404).json({ error: 'User not found. Register first.' });
+  try {
+    const user = await db.prepare('SELECT id FROM users WHERE phone = $1').get(phone);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found. Register first.' });
+    }
+    req.userId = user.id;
+    next();
+  } catch (err) {
+    console.error('[Auth] Error:', err.message);
+    res.status(500).json({ error: 'Auth error' });
   }
-
-  req.userId = user.id;
-  next();
 }
 
 module.exports = { getUserId };

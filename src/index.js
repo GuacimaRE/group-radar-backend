@@ -9,7 +9,6 @@ const cors = require('cors');
 const helmet = require('helmet');
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const url = require('url');
 
 const { initDB, db } = require('./db');
 const waManager = require('./services/wa-manager');
@@ -23,7 +22,6 @@ const alertsRoutes = require('./routes/alerts');
 
 const PORT = process.env.PORT || 3000;
 
-// Express app
 const app = express();
 app.use(helmet());
 app.use(cors({
@@ -36,7 +34,7 @@ app.use(express.json());
 app.get('/api/health', (req, res) => {
   const sessions = waManager.sessions.size;
   const connected = [...waManager.sessions.values()].filter(s => s.status === 'connected').length;
-  res.json({ status: 'ok', sessions, connected, uptime: process.uptime() });
+  res.json({ status: 'ok', db: 'postgres', sessions, connected, uptime: process.uptime() });
 });
 
 // API Routes
@@ -45,13 +43,12 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/alerts', alertsRoutes);
 
-// Create HTTP server
 const server = http.createServer(app);
 
 // WebSocket server for real-time QR updates
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
   const params = new URL(req.url, `http://localhost:${PORT}`).searchParams;
   const phone = params.get('phone');
 
@@ -60,55 +57,64 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  const user = db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
-  if (!user) {
-    ws.close(4004, 'User not found');
-    return;
+  try {
+    const user = await db.prepare('SELECT id FROM users WHERE phone = $1').get(phone);
+    if (!user) {
+      ws.close(4004, 'User not found');
+      return;
+    }
+
+    console.log(`[WS] User ${user.id} connected for QR updates`);
+    waManager.addQRListener(user.id, ws);
+
+    ws.on('close', () => {
+      waManager.removeQRListener(user.id, ws);
+    });
+  } catch (err) {
+    console.error('[WS] Connection error:', err.message);
+    ws.close(4500, 'Server error');
   }
-
-  console.log(`[WS] User ${user.id} connected for QR updates`);
-  waManager.addQRListener(user.id, ws);
-
-  ws.on('close', () => {
-    waManager.removeQRListener(user.id, ws);
-  });
 });
 
 // Initialize scanner
 const scanner = new Scanner(waManager);
 
-// Start server (async init)
+// Start server
 async function start() {
   await initDB();
-  console.log('[DB] Ready');
+  console.log('[DB] PostgreSQL ready');
+
+  server.listen(PORT, async () => {
+    console.log(`
+  ╔══════════════════════════════════════╗
+  ║   📡 Group Radar Backend v2.0       ║
+  ║   Port: ${PORT}                         ║
+  ║   DB: PostgreSQL                    ║
+  ║   ENV: ${(process.env.NODE_ENV || 'development').padEnd(24)}║
+  ╚══════════════════════════════════════╝
+    `);
+
+    // Restore previously connected WhatsApp sessions
+    await waManager.restoreAll();
+  });
 }
 
-start().then(() => {
-server.listen(PORT, async () => {
-  console.log(`
-  ╔══════════════════════════════════════╗
-  ║   📡 Group Radar Backend v1.0       ║
-  ║   Port: ${PORT}                         ║
-  ║   ENV: ${process.env.NODE_ENV || 'development'}               ║
-  ╚══════════════════════════════════════╝
-  `);
-
-  // Restore previously connected sessions
-  await waManager.restoreAll();
+start().catch(err => {
+  console.error('Failed to start:', err);
+  process.exit(1);
 });
-}).catch(err => { console.error('Failed to start:', err); process.exit(1); });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('[Server] Shutting down...');
   server.close();
-  db.close();
+  await db.close();
   process.exit(0);
 });
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('[Server] Interrupted, shutting down...');
   server.close();
-  db.close();
+  await db.close();
   process.exit(0);
 });
