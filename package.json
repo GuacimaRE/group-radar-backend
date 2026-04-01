@@ -20,7 +20,6 @@
     "bcryptjs": "^2.4.3",
     "express-rate-limit": "^7.5.0",
     "jsonwebtoken": "^9.0.2",
-    "stripe": "^17.5.0",
     "ws": "^8.18.0"
   }
 }

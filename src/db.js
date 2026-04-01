@@ -117,8 +117,12 @@ async function initDB() {
 
     // Migration: add new columns if they don't exist
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password TEXT`);
-    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`);
-    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ls_customer_id TEXT`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ls_subscription_id TEXT`);
+
+    // Drop old Stripe columns if they exist
+    await client.query(`ALTER TABLE users DROP COLUMN IF EXISTS stripe_customer_id`);
+    await client.query(`ALTER TABLE users DROP COLUMN IF EXISTS stripe_subscription_id`);
 
     console.log('[DB] PostgreSQL tables ready');
   } finally {

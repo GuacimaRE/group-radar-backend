@@ -1,55 +1,57 @@
 /**
- * Payment routes — Stripe integration
- * $4.99/month subscription
+ * Payment routes — LemonSqueezy integration
+ * Replaces Stripe (not available in Costa Rica)
  */
 const express = require('express');
+const crypto = require('crypto');
+const axios = require('axios');
 const { db } = require('../db');
 const { getUserId } = require('../middleware/auth');
 
 const router = express.Router();
 
-function getStripe() {
-  return require('stripe')(process.env.STRIPE_SECRET_KEY);
-}
-
-// POST /api/payments/create-checkout — Create Stripe Checkout session
+// POST /api/payments/create-checkout — Create LemonSqueezy Checkout
 router.post('/create-checkout', getUserId, async (req, res) => {
   try {
-    const stripe = getStripe();
     const user = await db.prepare('SELECT * FROM users WHERE id = $1').get(req.userId);
 
     if (!user) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
-    // Reuse or create Stripe customer
-    let customerId = user.stripe_customer_id;
-    if (!customerId) {
-      const customer = await stripe.customers.create({
-        metadata: { userId: String(user.id) },
-        phone: user.phone,
-        name: user.name || undefined,
-      });
-      customerId = customer.id;
-      await db.prepare('UPDATE users SET stripe_customer_id = $1 WHERE id = $2').run(customerId, user.id);
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      customer: customerId,
-      mode: 'subscription',
-      payment_method_types: ['card'],
-      line_items: [{
-        price: process.env.STRIPE_PRICE_ID,
-        quantity: 1,
-      }],
-      success_url: `${process.env.FRONTEND_URL || 'https://groupradar.io'}/dashboard?payment=success`,
-      cancel_url: `${process.env.FRONTEND_URL || 'https://groupradar.io'}/dashboard?payment=cancelled`,
-      metadata: { userId: String(user.id) },
+    const response = await axios.post('https://api.lemonsqueezy.com/v1/checkouts', {
+      data: {
+        type: 'checkouts',
+        attributes: {
+          checkout_data: {
+            custom: {
+              user_id: String(user.id)
+            }
+          },
+          checkout_options: {
+            embed: false
+          },
+          product_options: {
+            redirect_url: (process.env.FRONTEND_URL || 'https://groupradar.io') + '/dashboard.html'
+          }
+        },
+        relationships: {
+          store: { data: { type: 'stores', id: String(process.env.LEMONSQUEEZY_STORE_ID) } },
+          variant: { data: { type: 'variants', id: String(process.env.LEMONSQUEEZY_VARIANT_ID) } }
+        }
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.LEMONSQUEEZY_API_KEY}`,
+        'Content-Type': 'application/vnd.api+json',
+        'Accept': 'application/vnd.api+json'
+      }
     });
 
-    res.json({ url: session.url, sessionId: session.id });
+    const checkoutUrl = response.data.data.attributes.url;
+    res.json({ url: checkoutUrl });
   } catch (err) {
-    console.error('[Payments] Checkout error:', err.message);
+    console.error('[Payments] Checkout error:', err.response?.data || err.message);
     res.status(500).json({ error: 'Error al crear sesión de pago' });
   }
 });
@@ -57,29 +59,25 @@ router.post('/create-checkout', getUserId, async (req, res) => {
 // GET /api/payments/status — Get user's payment status
 router.get('/status', getUserId, async (req, res) => {
   try {
-    const user = await db.prepare('SELECT plan, stripe_customer_id, stripe_subscription_id FROM users WHERE id = $1').get(req.userId);
+    const user = await db.prepare(
+      'SELECT plan, ls_customer_id, ls_subscription_id FROM users WHERE id = $1'
+    ).get(req.userId);
 
     if (!user) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
-    let subscription = null;
-    if (user.stripe_subscription_id) {
-      try {
-        const stripe = getStripe();
-        const sub = await stripe.subscriptions.retrieve(user.stripe_subscription_id);
-        subscription = {
-          status: sub.status,
-          currentPeriodEnd: sub.current_period_end,
-          cancelAtPeriodEnd: sub.cancel_at_period_end,
-        };
-      } catch {}
+    const result = {
+      plan: user.plan || 'free',
+      ls_customer_id: user.ls_customer_id || null,
+      ls_subscription_id: user.ls_subscription_id || null,
+    };
+
+    if (user.ls_subscription_id && process.env.LEMONSQUEEZY_STORE_URL) {
+      result.customer_portal_url = process.env.LEMONSQUEEZY_STORE_URL;
     }
 
-    res.json({
-      plan: user.plan || 'free',
-      subscription,
-    });
+    res.json(result);
   } catch (err) {
     console.error('[Payments] Status error:', err.message);
     res.status(500).json({ error: 'Error al obtener estado de pago' });
@@ -89,55 +87,86 @@ router.get('/status', getUserId, async (req, res) => {
 module.exports = router;
 
 /**
- * Stripe webhook handler — must be registered BEFORE express.json()
- * Use express.raw({ type: 'application/json' }) for signature verification
+ * LemonSqueezy webhook handler — must be registered BEFORE express.json()
+ * Use express.raw({ type: 'application/json' }) for HMAC signature verification
  */
 module.exports.webhookHandler = async (req, res) => {
-  const stripe = getStripe();
-  const sig = req.headers['stripe-signature'];
-
-  let event;
+  // Always return 200 so LemonSqueezy doesn't retry
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('[Stripe] Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
+    const rawBody = typeof req.body === 'string' ? req.body : req.body.toString('utf8');
+    const signature = req.headers['x-signature'];
 
-  try {
-    switch (event.type) {
-      case 'checkout.session.completed': {
-        const session = event.data.object;
-        const userId = session.metadata?.userId;
-        if (userId) {
+    if (!signature || !process.env.LEMONSQUEEZY_WEBHOOK_SECRET) {
+      console.error('[LemonSqueezy] Missing signature or webhook secret');
+      return res.status(200).json({ received: true });
+    }
+
+    // Verify HMAC SHA256 signature
+    const hmac = crypto.createHmac('sha256', process.env.LEMONSQUEEZY_WEBHOOK_SECRET);
+    hmac.update(rawBody);
+    const digest = hmac.digest('hex');
+
+    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature))) {
+      console.error('[LemonSqueezy] Webhook signature verification failed');
+      return res.status(200).json({ received: true });
+    }
+
+    const payload = JSON.parse(rawBody);
+    const eventName = payload.meta?.event_name;
+    const userId = payload.meta?.custom_data?.user_id;
+    const attributes = payload.data?.attributes || {};
+    const customerId = attributes.customer_id ? String(attributes.customer_id) : null;
+    const subscriptionId = payload.data?.id ? String(payload.data.id) : null;
+    const status = attributes.status;
+
+    console.log(`[LemonSqueezy] Event: ${eventName}, userId: ${userId}, status: ${status}`);
+
+    if (!userId) {
+      console.warn('[LemonSqueezy] No user_id in custom_data, skipping');
+      return res.status(200).json({ received: true });
+    }
+
+    const uid = parseInt(userId);
+
+    switch (eventName) {
+      case 'subscription_created': {
+        await db.prepare(
+          'UPDATE users SET plan = $1, ls_customer_id = $2, ls_subscription_id = $3, updated_at = NOW() WHERE id = $4'
+        ).run('pro', customerId, subscriptionId, uid);
+        console.log(`[LemonSqueezy] User ${uid} upgraded to pro`);
+        break;
+      }
+
+      case 'subscription_updated': {
+        if (status === 'active') {
           await db.prepare(
-            'UPDATE users SET plan = $1, stripe_subscription_id = $2, updated_at = NOW() WHERE id = $3'
-          ).run('pro', session.subscription, parseInt(userId));
-          console.log(`[Stripe] User ${userId} upgraded to pro`);
+            'UPDATE users SET plan = $1, ls_customer_id = $2, ls_subscription_id = $3, updated_at = NOW() WHERE id = $4'
+          ).run('pro', customerId, subscriptionId, uid);
+          console.log(`[LemonSqueezy] User ${uid} subscription active → pro`);
+        } else if (['cancelled', 'expired', 'past_due'].includes(status)) {
+          await db.prepare(
+            'UPDATE users SET plan = $1, updated_at = NOW() WHERE id = $2'
+          ).run('free', uid);
+          console.log(`[LemonSqueezy] User ${uid} subscription ${status} → free`);
         }
         break;
       }
 
-      case 'customer.subscription.deleted': {
-        const subscription = event.data.object;
-        const customerId = subscription.customer;
-        // Find user by stripe_customer_id
-        const user = await db.prepare('SELECT id FROM users WHERE stripe_customer_id = $1').get(customerId);
-        if (user) {
-          await db.prepare(
-            'UPDATE users SET plan = $1, stripe_subscription_id = NULL, updated_at = NOW() WHERE id = $2'
-          ).run('free', user.id);
-          console.log(`[Stripe] User ${user.id} downgraded to free`);
-        }
+      case 'subscription_cancelled':
+      case 'subscription_expired': {
+        await db.prepare(
+          'UPDATE users SET plan = $1, updated_at = NOW() WHERE id = $2'
+        ).run('free', uid);
+        console.log(`[LemonSqueezy] User ${uid} → free (${eventName})`);
         break;
       }
 
       default:
-        console.log(`[Stripe] Unhandled event: ${event.type}`);
+        console.log(`[LemonSqueezy] Unhandled event: ${eventName}`);
     }
   } catch (err) {
-    console.error('[Stripe] Webhook processing error:', err.message);
+    console.error('[LemonSqueezy] Webhook processing error:', err.message);
   }
 
-  res.json({ received: true });
+  res.status(200).json({ received: true });
 };

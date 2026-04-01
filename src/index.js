@@ -34,7 +34,7 @@ app.use(cors({
   credentials: true,
 }));
 
-// Stripe webhook needs raw body — MUST be before express.json()
+// LemonSqueezy webhook needs raw body for HMAC verification — MUST be before express.json()
 app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), webhookHandler);
 
 // JSON body parser for all other routes
