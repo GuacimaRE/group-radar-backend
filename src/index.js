@@ -9,6 +9,8 @@ const cors = require('cors');
 const helmet = require('helmet');
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 
 const { initDB, db } = require('./db');
 const waManager = require('./services/wa-manager');
@@ -19,8 +21,11 @@ const authRoutes = require('./routes/auth');
 const settingsRoutes = require('./routes/settings');
 const whatsappRoutes = require('./routes/whatsapp');
 const alertsRoutes = require('./routes/alerts');
+const paymentRoutes = require('./routes/payments');
+const { webhookHandler } = require('./routes/payments');
 
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
 
 const app = express();
 app.use(helmet());
@@ -28,7 +33,32 @@ app.use(cors({
   origin: process.env.FRONTEND_URL || '*',
   credentials: true,
 }));
+
+// Stripe webhook needs raw body — MUST be before express.json()
+app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), webhookHandler);
+
+// JSON body parser for all other routes
 app.use(express.json());
+
+// Rate limiters
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas solicitudes. Intenta de nuevo en unos minutos.' },
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiados intentos de autenticación. Intenta de nuevo en 15 minutos.' },
+});
+
+app.use('/api/', generalLimiter);
+app.use('/api/auth/', authLimiter);
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -42,6 +72,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/alerts', alertsRoutes);
+app.use('/api/payments', paymentRoutes);
 
 const server = http.createServer(app);
 
@@ -50,30 +81,41 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', async (ws, req) => {
   const params = new URL(req.url, `http://localhost:${PORT}`).searchParams;
+
+  // Support JWT token auth (preferred) or legacy phone param
+  const token = params.get('token');
   const phone = params.get('phone');
 
-  if (!phone) {
-    ws.close(4001, 'Missing phone parameter');
+  let userId = null;
+
+  if (token) {
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const user = await db.prepare('SELECT id FROM users WHERE id = $1').get(payload.userId);
+      if (user) userId = user.id;
+    } catch (err) {
+      ws.close(4001, 'Invalid token');
+      return;
+    }
+  } else if (phone) {
+    // Legacy: phone-based lookup
+    try {
+      const user = await db.prepare('SELECT id FROM users WHERE phone = $1').get(phone);
+      if (user) userId = user.id;
+    } catch {}
+  }
+
+  if (!userId) {
+    ws.close(4001, 'Authentication required');
     return;
   }
 
-  try {
-    const user = await db.prepare('SELECT id FROM users WHERE phone = $1').get(phone);
-    if (!user) {
-      ws.close(4004, 'User not found');
-      return;
-    }
+  console.log(`[WS] User ${userId} connected for QR updates`);
+  waManager.addQRListener(userId, ws);
 
-    console.log(`[WS] User ${user.id} connected for QR updates`);
-    waManager.addQRListener(user.id, ws);
-
-    ws.on('close', () => {
-      waManager.removeQRListener(user.id, ws);
-    });
-  } catch (err) {
-    console.error('[WS] Connection error:', err.message);
-    ws.close(4500, 'Server error');
-  }
+  ws.on('close', () => {
+    waManager.removeQRListener(userId, ws);
+  });
 });
 
 // Initialize scanner
@@ -87,9 +129,10 @@ async function start() {
   server.listen(PORT, async () => {
     console.log(`
   ╔══════════════════════════════════════╗
-  ║   📡 Group Radar Backend v2.0       ║
+  ║   📡 Group Radar Backend v2.1       ║
   ║   Port: ${PORT}                         ║
   ║   DB: PostgreSQL                    ║
+  ║   Auth: JWT                         ║
   ║   ENV: ${(process.env.NODE_ENV || 'development').padEnd(24)}║
   ╚══════════════════════════════════════╝
     `);

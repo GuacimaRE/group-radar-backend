@@ -115,6 +115,11 @@ async function initDB() {
       )
     `);
 
+    // Migration: add new columns if they don't exist
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password TEXT`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`);
+
     console.log('[DB] PostgreSQL tables ready');
   } finally {
     client.release();
