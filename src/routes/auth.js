@@ -15,10 +15,10 @@ function signToken(userId) {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
 }
 
-// POST /api/auth/register — Register with phone, name, password
+// POST /api/auth/register — Register with phone, name, email, password
 router.post('/register', async (req, res) => {
   try {
-    const { phone, name, password } = req.body;
+    const { phone, name, email, password } = req.body;
 
     if (!phone || !/^\+?\d{8,15}$/.test(phone.replace(/\s/g, ''))) {
       return res.status(400).json({ error: 'Número de teléfono inválido' });
@@ -28,25 +28,42 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
     }
 
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Correo electrónico inválido' });
+    }
+
     const cleanPhone = phone.replace(/\s/g, '');
+    const cleanEmail = email ? email.toLowerCase().trim() : null;
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Check if user exists
+    // Ensure email column exists (migration safety)
+    try {
+      await db.prepare("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT").run();
+    } catch (_) {}
+
+    // Check if phone already exists
     let user = await db.prepare('SELECT * FROM users WHERE phone = $1').get(cleanPhone);
+    if (user && user.password) {
+      return res.status(409).json({ error: 'Este número ya está registrado. Iniciá sesión.' });
+    }
+
+    // Check if email already exists
+    if (cleanEmail) {
+      const emailUser = await db.prepare('SELECT * FROM users WHERE email = $1').get(cleanEmail);
+      if (emailUser) {
+        return res.status(409).json({ error: 'Este correo ya está registrado.' });
+      }
+    }
 
     if (user) {
-      // User exists — if they don't have a password, set it; otherwise reject
-      if (user.password) {
-        return res.status(409).json({ error: 'Este número ya está registrado. Usa /login.' });
-      }
-      // Set password for existing user
-      await db.prepare('UPDATE users SET password = $1, name = COALESCE($2, name), updated_at = NOW() WHERE id = $3').run(hashedPassword, name || null, user.id);
+      await db.prepare('UPDATE users SET password = $1, name = COALESCE($2, name), email = COALESCE($3, email), updated_at = NOW() WHERE id = $4')
+        .run(hashedPassword, name || null, cleanEmail, user.id);
       user.name = name || user.name;
+      user.email = cleanEmail || user.email;
     } else {
-      // Create new user
       user = await db.prepare(
-        'INSERT INTO users (phone, name, password) VALUES ($1, $2, $3) RETURNING *'
-      ).get(cleanPhone, name || null, hashedPassword);
+        'INSERT INTO users (phone, name, email, password) VALUES ($1, $2, $3, $4) RETURNING *'
+      ).get(cleanPhone, name || null, cleanEmail, hashedPassword);
     }
 
     const token = signToken(user.id);
@@ -56,6 +73,7 @@ router.post('/register', async (req, res) => {
         id: user.id,
         phone: user.phone,
         name: user.name,
+        email: user.email,
         plan: user.plan || 'free',
         wa_connected: !!user.wa_connected,
       },
@@ -67,17 +85,22 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// POST /api/auth/login — Login with phone + password
+// POST /api/auth/login — Login with phone or email + password
 router.post('/login', async (req, res) => {
   try {
-    const { phone, password } = req.body;
+    const { phone, email, password } = req.body;
 
-    if (!phone || !password) {
-      return res.status(400).json({ error: 'Teléfono y contraseña son requeridos' });
+    if ((!phone && !email) || !password) {
+      return res.status(400).json({ error: 'Teléfono o correo y contraseña son requeridos' });
     }
 
-    const cleanPhone = phone.replace(/\s/g, '');
-    const user = await db.prepare('SELECT * FROM users WHERE phone = $1').get(cleanPhone);
+    let user;
+    if (email) {
+      user = await db.prepare('SELECT * FROM users WHERE email = $1').get(email.toLowerCase().trim());
+    } else {
+      const cleanPhone = phone.replace(/\s/g, '');
+      user = await db.prepare('SELECT * FROM users WHERE phone = $1').get(cleanPhone);
+    }
 
     if (!user) {
       return res.status(401).json({ error: 'Credenciales inválidas' });
