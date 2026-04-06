@@ -60,6 +60,20 @@ const authLimiter = rateLimit({
 app.use('/api/', generalLimiter);
 app.use('/api/auth/', authLimiter);
 
+// Temp: set password for existing user
+app.post('/api/auth/set-password', async (req, res) => {
+  const { phone, password, secret } = req.body;
+  if (secret !== 'wercr2026') return res.status(403).json({ error: 'forbidden' });
+  const bcrypt = require('bcryptjs');
+  const { db } = require('./db');
+  const hashed = await bcrypt.hash(password, 10);
+  try {
+    await db.prepare('ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT').run();
+  } catch(_) {}
+  await db.prepare('UPDATE users SET password = $1 WHERE phone = $2').run(hashed, phone);
+  res.json({ ok: true });
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   const sessions = waManager.sessions.size;
