@@ -60,6 +60,17 @@ const authLimiter = rateLimit({
 app.use('/api/', generalLimiter);
 app.use('/api/auth/', authLimiter);
 
+// Temp: clear WA auth for user
+app.post('/api/auth/clear-wa', async (req, res) => {
+  const { phone, secret } = req.body;
+  if (secret !== 'wercr2026') return res.status(403).json({ error: 'forbidden' });
+  const { db } = require('./db');
+  const user = await db.prepare('SELECT id FROM users WHERE phone = $1').get(phone);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  await db.prepare('DELETE FROM wa_auth_keys WHERE user_id = $1').run(user.id);
+  res.json({ ok: true, userId: user.id });
+});
+
 // Temp: set password for existing user
 app.post('/api/auth/set-password', async (req, res) => {
   const { phone, password, secret } = req.body;
