@@ -47,7 +47,11 @@ class WAManager {
       printQRInTerminal: false,
       browser: ['Group Radar', 'Chrome', '120.0'],
       getMessage: async () => undefined,
+      mobile: false,
     });
+
+    // Store socket reference for pairing code request
+    sessionData && (sessionData.socket = socket);
 
     const sessionData = {
       socket,
@@ -159,6 +163,13 @@ class WAManager {
     } catch (err) {
       console.error(`[WA] User ${userId}: group sync error:`, err.message);
     }
+  }
+
+  async requestPairingCode(userId, phoneNumber) {
+    const session = this.sessions.get(userId);
+    if (!session || !session.socket) throw new Error('No active session');
+    const code = await session.socket.requestPairingCode(phoneNumber);
+    return code;
   }
 
   getStatus(userId) {
